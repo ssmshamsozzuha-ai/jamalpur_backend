@@ -85,8 +85,15 @@ app.use(
 // MongoDB Connection with Performance Optimizations
 const MONGODB_URI = process.env.MONGODB_URI;
 
-// Configure multer for file uploads (filesystem storage for now)
-const storage = multer.diskStorage({
+// Debug: Log the connection string (first 50 characters for security)
+console.log("🔍 MongoDB URI (first 50 chars):", MONGODB_URI ? MONGODB_URI.substring(0, 50) + "..." : "UNDEFINED");
+console.log("🔍 MongoDB URI length:", MONGODB_URI ? MONGODB_URI.length : 0);
+
+// Import Cloudinary upload middleware
+const { upload, deleteFromCloudinary, getFileUrl } = require("./middleware/cloudinaryUpload");
+
+// Keep local storage for backward compatibility (existing files)
+const localStorage = multer.diskStorage({
   destination: (req, file, cb) => cb(null, uploadsDir),
   filename: (req, file, cb) => {
     const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
@@ -97,8 +104,8 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({
-  storage,
+const localUpload = multer({
+  storage: localStorage,
   fileFilter: (req, file, cb) => {
     const allowed =
       file.mimetype === "application/pdf" || file.mimetype.startsWith("image/");
@@ -110,6 +117,18 @@ const upload = multer({
   limits: { fileSize: 10 * 1024 * 1024 },
 });
 
+// Validate MongoDB URI before connecting
+if (!MONGODB_URI) {
+  console.error("❌ MONGODB_URI environment variable is not set!");
+  process.exit(1);
+}
+
+if (!MONGODB_URI.startsWith('mongodb://') && !MONGODB_URI.startsWith('mongodb+srv://')) {
+  console.error("❌ Invalid MongoDB URI format. Must start with 'mongodb://' or 'mongodb+srv://'");
+  console.error("❌ Current URI starts with:", MONGODB_URI.substring(0, 20));
+  process.exit(1);
+}
+
 mongoose
   .connect(MONGODB_URI, {
     maxPoolSize: 10, // Maintain up to 10 socket connections
@@ -119,7 +138,11 @@ mongoose
   .then(() => {
     console.log("✅ MongoDB Connected Successfully");
   })
-  .catch((err) => console.error("❌ MongoDB Connection Error:", err));
+  .catch((err) => {
+    console.error("❌ MongoDB Connection Error:", err);
+    console.error("❌ Connection string format check failed");
+    process.exit(1);
+  });
 
 // MongoDB Schemas
 const userSchema = new mongoose.Schema({
@@ -144,10 +167,11 @@ const formSubmissionSchema = new mongoose.Schema({
   category: { type: String, default: "general" },
   address: { type: String, default: "" },
   pdfFile: {
-    filename: { type: String },
+    publicId: { type: String }, // Cloudinary public ID
     originalName: { type: String },
-    path: { type: String },
+    url: { type: String }, // Cloudinary URL
     size: { type: Number },
+    mimetype: { type: String },
   },
   submittedAt: { type: Date, default: Date.now },
 });
@@ -165,8 +189,9 @@ const noticeSchema = new mongoose.Schema({
     default: "normal",
   },
   pdfFile: {
-    filename: { type: String },
+    publicId: { type: String }, // Cloudinary public ID
     originalName: { type: String },
+    url: { type: String }, // Cloudinary URL
     mimetype: { type: String },
     size: { type: Number },
   },
@@ -670,13 +695,14 @@ app.post(
         address: address || "",
       };
 
-      // Add PDF file information if uploaded
+      // Add PDF file information if uploaded to Cloudinary
       if (req.file) {
         submissionData.pdfFile = {
-          filename: req.file.filename,
+          publicId: req.file.public_id,
           originalName: req.file.originalname,
-          path: req.file.path,
+          url: req.file.secure_url,
           size: req.file.size,
+          mimetype: req.file.mimetype,
         };
       }
 
@@ -700,9 +726,9 @@ app.post(
     } catch (error) {
       console.error("Form submission with file error:", error);
 
-      // Clean up uploaded file if there was an error
-      if (req.file) {
-        fs.unlinkSync(req.file.path);
+      // Clean up uploaded file from Cloudinary if there was an error
+      if (req.file && req.file.public_id) {
+        await deleteFromCloudinary(req.file.public_id);
       }
 
       res.status(500).json({ message: "Server error during form submission" });
@@ -743,11 +769,12 @@ app.post(
         author: req.user.email,
       };
 
-      // Handle PDF file upload
+      // Handle PDF file upload to Cloudinary
       if (req.file) {
         noticeData.pdfFile = {
-          filename: req.file.filename,
+          publicId: req.file.public_id,
           originalName: req.file.originalname,
+          url: req.file.secure_url,
           mimetype: req.file.mimetype,
           size: req.file.size,
         };
@@ -811,16 +838,28 @@ app.put(
     try {
       const { title, content, priority, isActive } = req.body;
 
+      // Get the existing notice first
+      const existingNotice = await Notice.findById(req.params.id);
+      if (!existingNotice) {
+        return res.status(404).json({ message: "Notice not found" });
+      }
+
       const updateData = { title, content, isActive };
       if (priority) {
         updateData.priority = priority;
       }
 
-      // Handle PDF file upload
+      // Handle PDF file upload to Cloudinary
       if (req.file) {
+        // Delete old file from Cloudinary if it exists
+        if (existingNotice.pdfFile && existingNotice.pdfFile.publicId) {
+          await deleteFromCloudinary(existingNotice.pdfFile.publicId);
+        }
+        
         updateData.pdfFile = {
-          filename: req.file.filename,
+          publicId: req.file.public_id,
           originalName: req.file.originalname,
+          url: req.file.secure_url,
           mimetype: req.file.mimetype,
           size: req.file.size,
         };
@@ -869,16 +908,9 @@ app.delete(
         return res.status(404).json({ message: "Notice not found" });
       }
 
-      // Delete associated PDF file from filesystem if it exists
-      if (notice.pdfFile && notice.pdfFile.filename) {
-        const filePath = path.join(uploadsDir, notice.pdfFile.filename);
-        fs.unlink(filePath, (err) => {
-          if (err) {
-            console.error("Error deleting PDF file:", err);
-          } else {
-            console.log("PDF file deleted:", notice.pdfFile.filename);
-          }
-        });
+      // Delete associated PDF file from Cloudinary if it exists
+      if (notice.pdfFile && notice.pdfFile.publicId) {
+        await deleteFromCloudinary(notice.pdfFile.publicId);
       }
 
       // Delete the notice from database
