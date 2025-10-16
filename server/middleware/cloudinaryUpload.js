@@ -1,7 +1,7 @@
 const multer = require("multer");
 const cloudinary = require("cloudinary").v2;
-const { CloudinaryStorage } = require("multer-storage-cloudinary");
 const path = require("path");
+const fs = require("fs");
 
 // Configure Cloudinary
 cloudinary.config({
@@ -10,22 +10,18 @@ cloudinary.config({
   api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-// Create Cloudinary storage configuration
-const storage = new CloudinaryStorage({
-  cloudinary: cloudinary,
-  params: {
-    folder: "jamalpur-chamber", // Main folder for all uploads
-    allowed_formats: ["pdf", "jpg", "jpeg", "png", "gif"],
-    resource_type: "auto", // Automatically detect file type
-    transformation: [
-      // For images, apply optimization
-      {
-        if: "w_>_1000",
-        width: 1000,
-        quality: "auto",
-        fetch_format: "auto"
-      }
-    ]
+// Create temporary storage for files before uploading to Cloudinary
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const tempDir = path.join(__dirname, "../temp");
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+    cb(null, tempDir);
+  },
+  filename: (req, file, cb) => {
+    const uniqueSuffix = `${Date.now()}-${Math.round(Math.random() * 1e9)}`;
+    cb(null, `${file.fieldname}-${uniqueSuffix}${path.extname(file.originalname)}`);
   },
 });
 
@@ -53,6 +49,30 @@ const upload = multer({
   },
 });
 
+// Helper function to upload file to Cloudinary
+const uploadToCloudinary = async (filePath, options = {}) => {
+  try {
+    const result = await cloudinary.uploader.upload(filePath, {
+      folder: "jamalpur-chamber",
+      resource_type: "auto",
+      quality: "auto",
+      fetch_format: "auto",
+      ...options
+    });
+    
+    // Clean up temporary file
+    fs.unlinkSync(filePath);
+    
+    return result;
+  } catch (error) {
+    // Clean up temporary file on error
+    if (fs.existsSync(filePath)) {
+      fs.unlinkSync(filePath);
+    }
+    throw error;
+  }
+};
+
 // Helper function to delete file from Cloudinary
 const deleteFromCloudinary = async (publicId) => {
   try {
@@ -79,6 +99,7 @@ const getFileUrl = (publicId, resourceType = "auto") => {
 
 module.exports = {
   upload,
+  uploadToCloudinary,
   deleteFromCloudinary,
   getFileUrl,
   cloudinary

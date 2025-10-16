@@ -90,7 +90,7 @@ console.log("🔍 MongoDB URI (first 50 chars):", MONGODB_URI ? MONGODB_URI.subs
 console.log("🔍 MongoDB URI length:", MONGODB_URI ? MONGODB_URI.length : 0);
 
 // Import Cloudinary upload middleware
-const { upload, deleteFromCloudinary, getFileUrl } = require("./middleware/cloudinaryUpload");
+const { upload, uploadToCloudinary, deleteFromCloudinary, getFileUrl } = require("./middleware/cloudinaryUpload");
 
 // Keep local storage for backward compatibility (existing files)
 const localStorage = multer.diskStorage({
@@ -697,13 +697,23 @@ app.post(
 
       // Add PDF file information if uploaded to Cloudinary
       if (req.file) {
-        submissionData.pdfFile = {
-          publicId: req.file.public_id,
-          originalName: req.file.originalname,
-          url: req.file.secure_url,
-          size: req.file.size,
-          mimetype: req.file.mimetype,
-        };
+        try {
+          const cloudinaryResult = await uploadToCloudinary(req.file.path);
+          submissionData.pdfFile = {
+            publicId: cloudinaryResult.public_id,
+            originalName: req.file.originalname,
+            url: cloudinaryResult.secure_url,
+            size: cloudinaryResult.bytes,
+            mimetype: req.file.mimetype,
+          };
+        } catch (uploadError) {
+          console.error("Cloudinary upload error:", uploadError);
+          // Clean up temporary file
+          if (fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          throw new Error("Failed to upload file to Cloudinary");
+        }
       }
 
       const submission = new FormSubmission(submissionData);
@@ -726,9 +736,9 @@ app.post(
     } catch (error) {
       console.error("Form submission with file error:", error);
 
-      // Clean up uploaded file from Cloudinary if there was an error
-      if (req.file && req.file.public_id) {
-        await deleteFromCloudinary(req.file.public_id);
+      // Clean up temporary file if there was an error
+      if (req.file && fs.existsSync(req.file.path)) {
+        fs.unlinkSync(req.file.path);
       }
 
       res.status(500).json({ message: "Server error during form submission" });
@@ -771,13 +781,23 @@ app.post(
 
       // Handle PDF file upload to Cloudinary
       if (req.file) {
-        noticeData.pdfFile = {
-          publicId: req.file.public_id,
-          originalName: req.file.originalname,
-          url: req.file.secure_url,
-          mimetype: req.file.mimetype,
-          size: req.file.size,
-        };
+        try {
+          const cloudinaryResult = await uploadToCloudinary(req.file.path);
+          noticeData.pdfFile = {
+            publicId: cloudinaryResult.public_id,
+            originalName: req.file.originalname,
+            url: cloudinaryResult.secure_url,
+            mimetype: req.file.mimetype,
+            size: cloudinaryResult.bytes,
+          };
+        } catch (uploadError) {
+          console.error("Cloudinary upload error:", uploadError);
+          // Clean up temporary file
+          if (fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          throw new Error("Failed to upload file to Cloudinary");
+        }
       }
 
       const notice = new Notice(noticeData);
@@ -851,18 +871,28 @@ app.put(
 
       // Handle PDF file upload to Cloudinary
       if (req.file) {
-        // Delete old file from Cloudinary if it exists
-        if (existingNotice.pdfFile && existingNotice.pdfFile.publicId) {
-          await deleteFromCloudinary(existingNotice.pdfFile.publicId);
+        try {
+          // Delete old file from Cloudinary if it exists
+          if (existingNotice.pdfFile && existingNotice.pdfFile.publicId) {
+            await deleteFromCloudinary(existingNotice.pdfFile.publicId);
+          }
+          
+          const cloudinaryResult = await uploadToCloudinary(req.file.path);
+          updateData.pdfFile = {
+            publicId: cloudinaryResult.public_id,
+            originalName: req.file.originalname,
+            url: cloudinaryResult.secure_url,
+            mimetype: req.file.mimetype,
+            size: cloudinaryResult.bytes,
+          };
+        } catch (uploadError) {
+          console.error("Cloudinary upload error:", uploadError);
+          // Clean up temporary file
+          if (fs.existsSync(req.file.path)) {
+            fs.unlinkSync(req.file.path);
+          }
+          throw new Error("Failed to upload file to Cloudinary");
         }
-        
-        updateData.pdfFile = {
-          publicId: req.file.public_id,
-          originalName: req.file.originalname,
-          url: req.file.secure_url,
-          mimetype: req.file.mimetype,
-          size: req.file.size,
-        };
       }
 
       const notice = await Notice.findByIdAndUpdate(req.params.id, updateData, {
